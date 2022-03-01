@@ -1,0 +1,209 @@
+---
+title: "Time Series Assignment"
+subtitle: 'DSTI A20 Cohort'
+author: "Ariel Nataf"
+output:
+  pdf_document: default
+---
+
+Importing libraries
+```{r, results='hide', message=FALSE}
+#install.packages("readxl")
+#install.packages("writexl")
+library(readxl)
+library(writexl)
+library(forecast)
+library(ggplot2)
+library(vars)
+```
+
+Loading the data 
+```{r}
+data = read_excel("/Users/arielnataf/Desktop/DSTI/TimeSeries/Elec-train.xlsx")
+```
+
+
+# Forcasting without using outdoor temperature
+
+frequency: 1 day = 96 quarters
+start: 01/01/2010 01:15 -> 6th quarter of the day
+end: 2/16/2010 23:45 -> 96th quarter of the 47th day
+
+```{r, fig.show='hide'}
+ts<-ts(data$`Power (kW)` ,start=c(1,6),end=c(47,96),freq=96)
+
+ts_train = window(ts, start=c(1,6),end=c(46,96))
+ts_test = window(ts, start=c(47,1),end=c(47,96))
+plot(ts)
+```
+
+The time series appears to be cyclical over a 96 period day period
+
+## Holt-Winter Forcasting
+
+the serie has a trend and a seasonal pattern, HW should be a good model.
+
+
+```{r}
+#For hs(), the max frequency is 24. We have to aggregate the values.
+ts24 = aggregate(ts, nfrequency = 24)/4
+
+# We don't have an increase of amplitude
+# so we are only looking at addititive seasonality
+fit1=hw(ts24,seasonal='additive',h=24)
+autoplot(tail(ts24,72)) +
+autolayer(fit1,series='HW add.',PI=FALSE)
+```
+The forecasting looks good, but **this solution doesn't give us 96 rows.**
+
+## Seasonal ARIMA Forcasting
+
+First looking at an auto ARIMA
+```{r, fig.show='hide'}
+fit_auto=auto.arima(ts_train,lambda = "auto")
+
+prev_arima=forecast(fit_auto,h=96)
+
+#autoplot(prev_arima)
+
+```
+
+> With auto.arima:
+>
+> ARIMA(5,0,0)(0,1,0)[96] 
+>
+>sigma^2 estimated as 0.4246:  log likelihood=-4272.53
+>
+> AIC=8557.07   AICc=8557.09   BIC=8595.29
+
+With lag 96, the ACF and PACF are simply not readable.
+I won't be attempting setting manually ARIMA
+
+## Neural Network Auto-Regression (NNAR) Forecasting
+
+```{r, results='hide', message=FALSE}
+fit_nn=nnetar(ts_train,t=96)
+prevNN=forecast(fit_nn,h=96)
+```
+
+## Selecting forecast
+
+We are not considering the HW solution because it couldn't perform the 96 predictied values per day expected.
+
+```{r}
+plot(ts_test,xlim=c(47,48))
+lines(ts_test,lty=2)
+lines(prev_arima$mean,col=2)
+lines(prevNN$mean,col=3)
+
+legend('topleft',col=1:3,lty=1,legend=c('test','SARIMA','NN'))
+```
+
+We are looking at the RMSE
+
+```{r}
+rmse <- function(serie_test,prev) {return=sqrt(mean((serie_test-prev$mean)^2))}
+
+sprintf('RMSE: • AUTO ARIMA: %f • NN: %f ',
+        rmse(ts_test, prev_arima), rmse(ts_test, prevNN))
+```
+
+NN has better results than ARIMA! We will use this solution.
+
+# Forcasting using outdoor temperature
+
+We now have an additional covariate Temp (C°).
+
+```{r}
+colnames(data) <- c("Timestamp","Power","Temp")
+#simpler to refer to objects with simple characters
+
+ts2<-ts(data[c("Power","Temp")],start=c(1,6),end=c(47,96),freq=96)
+
+ts2_train = window(ts2, start=c(1,6),end=c(44,96))
+ts2_test = window(ts2, start=c(45,1),end=c(47,96))
+```
+
+## Time series regression forecasting
+
+```{r, results='hide', message=FALSE}
+?tslm
+fit=tslm(Power~Temp+trend+season,data=ts2)
+summary(fit)
+CV(fit)
+```
+All the features seem relevant
+
+```{r, fig.show='hide'}
+checkresiduals(fit,test=FALSE,plot=TRUE)
+```
+
+```{r, fig.show='hide'}
+plot(pacf(fit$residuals))
+
+```
+
+```{r}
+tmp=fit$residuals
+#fit2=Arima(tmp,order=c(13,0,0))
+#checkresiduals(fit2)
+#plot(pacf(fit2$residuals))
+
+```
+
+## VAR forecasting
+
+```{r, results='hide', message=FALSE}
+VARselect(ts2_train, lag.max=150, type="const")
+```
+Thanks to AIC, we choose order 103
+
+```{r}
+var <- VAR(ts2_train, p=103,type = "const")
+prev_var=forecast(var,h=96,PI=FALSE)
+plot(prev_var)
+```
+
+
+## Selecting forecast
+
+
+```{r}
+plot(ts2_test[,'Power'] ,xlim=c(45,48))
+lines(ts2_test[,'Power'],lty=2)
+lines(prev_var$forecast$Power$mean ,col=2)
+
+legend('topleft',col=1:3,lty=1,legend=c('test','VAR'))
+```
+
+
+```{r}
+rmse <- function(serie_test,prev) {return=sqrt(mean((serie_test-prev$mean)^2))}
+
+sprintf('RMSE: • VAR: %f ', rmse(ts2_test[,"Power"], prev_var$forecast$Power))
+
+```
+
+# Generating and Saving Final Forecast
+
+
+```{r, results='hide', message=FALSE}
+
+fit_nn=nnetar(ts,t=96)
+prevNN_results=forecast(fit_nn,h=96)
+```
+
+```{r}
+var_results <- VAR(ts2, p=103,type = "const")
+prev_var_results=forecast(var_results,h=96,PI=FALSE)
+
+df <- data.frame(univariate = prevNN_results,
+                 covariate = prev_var_results$forecast$Power)
+df = subset(df, select = -c(3:8))
+colnames(df) <- c("univariate", "covariate")
+print(head(df))
+```
+```{r}
+write_xlsx(df, "./Ariel_Nataf.xlsx")
+```
+
